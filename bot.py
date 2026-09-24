@@ -216,7 +216,7 @@ async def main():
                             duration=msg.video.duration,
                             width=msg.video.width,
                             height=msg.video.height,
-                            thumbnail=None, # Removed thumbnail as requested
+                            thumb=None, # Removed thumbnail as requested
                             supports_streaming=True,
                             progress=progress_bar,
                             progress_args=("-> Uploading",)
