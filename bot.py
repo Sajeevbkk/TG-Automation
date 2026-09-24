@@ -69,12 +69,41 @@ async def ensure_peer_cached(app: Client, chat_target):
         return chat
     except Exception:
         print(f"[*] Chat {chat_target} is missing from local cache. Scanning your chat list to find it...")
+        
+        # Prepare variants of the ID (in case the -100 prefix is missing or wrong)
+        target_variants = [chat_target]
+        if isinstance(chat_target, int):
+            target_str = str(chat_target)
+            if target_str.startswith("-100"):
+                target_variants.append(int(target_str[4:]))      # e.g., 2622933496
+                target_variants.append(int(f"-{target_str[4:]}")) # e.g., -2622933496
+            else:
+                clean_id = target_str.lstrip('-')
+                target_variants.append(int(f"-100{clean_id}"))    # e.g., -1002622933496
+        
+        found_chats = []
+
         async for dialog in app.get_dialogs():
-            # Iterating dialogs forces Pyrogram to cache the access hashes of all chats
-            if dialog.chat.id == chat_target or dialog.chat.username == chat_target:
+            # Save all groups/channels for debugging just in case
+            if dialog.chat.type in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
+                found_chats.append(f"{dialog.chat.title} | ID: {dialog.chat.id}")
+
+            # Check if this chat matches any ID variant or username
+            if dialog.chat.id in target_variants or dialog.chat.username == chat_target:
                 print(f"[✓] Found and cached: {dialog.chat.title}")
                 return dialog.chat
         
+        # If we get here, the channel wasn't found at all. Dump the list to a file.
+        try:
+            with open("my_channels.txt", "w", encoding="utf-8") as f:
+                f.write("=== YOUR GROUPS & CHANNELS ===\n\n")
+                f.write("\n".join(found_chats))
+            print("\n[!] FATAL ERROR: Cannot access source channel.")
+            print("    I have saved a list of ALL your joined groups/channels to 'my_channels.txt'.")
+            print("    Please open that file, search for your channel's name, and update your .env file with the exact ID shown there.")
+        except Exception as e:
+            print(f"    (Could not save my_channels.txt: {e})")
+
         return None
 
 async def verify_destination_permissions(app: Client, dest_chat) -> bool:
