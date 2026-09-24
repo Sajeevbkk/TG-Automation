@@ -22,12 +22,22 @@ from pyrogram.errors import FloodWait, ChatWriteForbidden, UserNotParticipant
 
 load_dotenv()
 
-# Safeguard for environment variables
+# --- Strict Environment Variable Validation ---
+_app_id_str = os.getenv("APP_ID")
+API_HASH = os.getenv("API_HASH")
+SOURCE_CHAT_ENV = os.getenv("SOURCE_CHAT")
+DEST_CHAT_ENV = os.getenv("DEST_CHAT")
+SCAN_LIMIT_ENV = os.getenv("SCAN_LIMIT")
+
+if not all([_app_id_str, API_HASH, SOURCE_CHAT_ENV, DEST_CHAT_ENV]):
+    print("[x] FATAL ERROR: Missing required environment variables.")
+    print("    Check your .env file and ensure APP_ID, API_HASH, SOURCE_CHAT, and DEST_CHAT are set.")
+    exit(1)
+
 try:
-    API_ID = int(os.getenv("APP_ID"))
-    API_HASH = os.getenv("API_HASH")
-except TypeError:
-    print("[x] Error: APP_ID or API_HASH missing in .env file.")
+    API_ID = int(_app_id_str)
+except ValueError:
+    print(f"[x] FATAL ERROR: APP_ID must be a number. You provided: '{_app_id_str}'")
     exit(1)
 
 app = Client("my_account", api_id=API_ID, api_hash=API_HASH)
@@ -46,24 +56,31 @@ def clean_caption(caption: str | None) -> str | None:
     cleaned = re.sub(r" +", " ", cleaned).strip()
     return cleaned if cleaned else None
 
-# --- Progress Bar Helper ---
 async def progress_bar(current, total, action_prefix):
-    """Displays a simple percentage progress in the console."""
+    """Displays a real-time progress bar in the console."""
     if total > 0:
         percent = (current / total) * 100
-        # Carriage return \r overwrites the current line
         print(f"\r {action_prefix}: {percent:.1f}% ({current // (1024*1024)}MB / {total // (1024*1024)}MB)", end="")
 
-async def sync_dialog_cache():
-    print("[*] Synchronizing chat dialogs...")
-    async for _ in app.get_dialogs(limit=50):
-        pass
+async def ensure_peer_cached(app: Client, chat_target):
+    """Scans dialogs to cache the access_hash for private channels you are subscribed to."""
+    try:
+        chat = await app.get_chat(chat_target)
+        return chat
+    except Exception:
+        print(f"[*] Chat {chat_target} is missing from local cache. Scanning your chat list to find it...")
+        async for dialog in app.get_dialogs():
+            # Iterating dialogs forces Pyrogram to cache the access hashes of all chats
+            if dialog.chat.id == chat_target or dialog.chat.username == chat_target:
+                print(f"[✓] Found and cached: {dialog.chat.title}")
+                return dialog.chat
+        
+        return None
 
 async def verify_destination_permissions(app: Client, dest_chat) -> bool:
-    try:
-        chat = await app.get_chat(dest_chat)
-    except Exception as e:
-        print(f"[x] Cannot resolve destination {dest_chat}: {e}")
+    chat = await ensure_peer_cached(app, dest_chat)
+    if not chat:
+        print(f"[x] Cannot resolve destination {dest_chat}. Are you a member/admin?")
         return False
 
     if chat.type in (ChatType.PRIVATE, ChatType.BOT):
@@ -72,7 +89,7 @@ async def verify_destination_permissions(app: Client, dest_chat) -> bool:
     try:
         member = await app.get_chat_member(chat.id, "me")
     except UserNotParticipant:
-        print(f"[x] Error: Your account is not in destination '{chat.title}' ({chat.id}).")
+        print(f"[x] Error: Your account is not in destination '{chat.title}'.")
         return False
     except Exception as e:
         print(f"[x] Could not inspect membership in '{chat.title}': {e}")
@@ -86,7 +103,7 @@ async def verify_destination_permissions(app: Client, dest_chat) -> bool:
                 return True
             print(f"[x] Error: Admin in '{chat.title}', but missing 'Post Messages' rights.")
             return False
-        print(f"[x] Error: You are only a subscriber in '{chat.title}'. Channel posting requires admin rights.")
+        print(f"[x] Error: You are only a subscriber in '{chat.title}'. You must be an admin to post.")
         return False
 
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -103,29 +120,38 @@ async def main():
         me = await app.get_me()
         print(f"[+] Logged in as: {me.first_name} (@{me.username}) | ID: {me.id}\n")
 
-        await sync_dialog_cache()
-
-        src_input = input("Enter Source Channel ID or @username: ")
-        dst_input = input("Enter Destination Channel/User ID or @username: ")
+        source_chat = parse_chat_target(SOURCE_CHAT_ENV)
+        dest_chat = parse_chat_target(DEST_CHAT_ENV)
         
-        # Optional: Ask user if they want to limit the history scan
-        limit_input = input("Enter max messages to scan (Leave blank for ALL): ")
-        scan_limit = int(limit_input) if limit_input.strip().isdigit() else None
+        scan_limit = None
+        if SCAN_LIMIT_ENV and SCAN_LIMIT_ENV.strip().isdigit():
+            scan_limit = int(SCAN_LIMIT_ENV.strip())
 
-        source_chat = parse_chat_target(src_input)
-        dest_chat = parse_chat_target(dst_input)
+        # Validate Source Channel (Read-only as Subscriber)
+        print(f"[+] Resolving Source Channel: {source_chat}...")
+        src_chat_info = await ensure_peer_cached(app, source_chat)
+        if not src_chat_info:
+            print(f"[x] FATAL ERROR: Cannot access source channel {source_chat}.")
+            print("    Fix: Make sure you have actually joined this channel with your Telegram account.")
+            return
+        print(f" -> Source verified: '{src_chat_info.title}'")
 
-        print("[+] Validating destination permissions...")
+        # Validate Destination Channel (Requires Admin/Write rights)
+        print("\n[+] Validating destination permissions...")
         if not await verify_destination_permissions(app, dest_chat):
             print("[-] Aborting process due to insufficient permissions.")
             return
+        print(f" -> Permissions verified.")
 
-        print(f"[+] Permissions verified. Scanning {source_chat} for videos...")
-
+        print(f"\n[+] Scanning {src_chat_info.title} for videos...")
         video_messages = []
-        async for message in app.get_chat_history(source_chat, limit=scan_limit):
-            if message.video:
-                video_messages.append(message)
+        try:
+            async for message in app.get_chat_history(source_chat, limit=scan_limit):
+                if message.video:
+                    video_messages.append(message)
+        except Exception as e:
+            print(f"[x] Failed to fetch chat history: {e}")
+            return
 
         video_messages.reverse()
         total = len(video_messages)
@@ -141,7 +167,7 @@ async def main():
             new_caption = clean_caption(msg.caption)
 
             try:
-                file_label = msg.video.file_name or "video.mp4"
+                file_label = msg.video.file_name or f"video_{msg.id}.mp4"
                 file_mb = round(msg.video.file_size / (1024 * 1024), 2)
                 print(f" -> Queued: {file_label} ({file_mb} MB)")
                 
@@ -150,7 +176,7 @@ async def main():
                     progress=progress_bar, 
                     progress_args=("-> Downloading",)
                 )
-                print() # Print newline after progress bar finishes
+                print() 
 
                 while True:
                     try:
@@ -161,17 +187,17 @@ async def main():
                             duration=msg.video.duration,
                             width=msg.video.width,
                             height=msg.video.height,
-                            thumbnail=None, # Changed 'thumb' to 'thumbnail' for Pyrogram v2
+                            thumbnail=None, # Removed thumbnail as requested
                             supports_streaming=True,
                             progress=progress_bar,
                             progress_args=("-> Uploading",)
                         )
                         print(f"\n[✓] Uploaded successfully (Msg ID: {msg.id})")
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(2.5) # Slight delay to avoid Telegram flood limits
                         break
 
                     except FloodWait as e:
-                        print(f"\n[!] FloodWait received: Sleeping {e.value}s...")
+                        print(f"\n[!] FloodWait received: Sleeping for {e.value} seconds...")
                         await asyncio.sleep(e.value)
 
                     except ChatWriteForbidden:
