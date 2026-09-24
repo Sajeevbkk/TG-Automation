@@ -8,7 +8,6 @@ import pyrogram.utils
 
 def patched_get_peer_type(peer_id: int) -> str:
     if peer_id < 0:
-        # Standard channel IDs start with -100 and can exceed -1999999999999
         if str(peer_id).startswith("-100"):
             return "channel"
         return "chat"
@@ -23,11 +22,15 @@ from pyrogram.errors import FloodWait, ChatWriteForbidden, UserNotParticipant
 
 load_dotenv()
 
-API_ID = int(os.getenv("APP_ID"))
-API_HASH = os.getenv("API_HASH")
+# Safeguard for environment variables
+try:
+    API_ID = int(os.getenv("APP_ID"))
+    API_HASH = os.getenv("API_HASH")
+except TypeError:
+    print("[x] Error: APP_ID or API_HASH missing in .env file.")
+    exit(1)
 
 app = Client("my_account", api_id=API_ID, api_hash=API_HASH)
-
 
 def parse_chat_target(target: str):
     target = target.strip()
@@ -36,7 +39,6 @@ def parse_chat_target(target: str):
     except ValueError:
         return target
 
-
 def clean_caption(caption: str | None) -> str | None:
     if not caption:
         return None
@@ -44,13 +46,18 @@ def clean_caption(caption: str | None) -> str | None:
     cleaned = re.sub(r" +", " ", cleaned).strip()
     return cleaned if cleaned else None
 
+# --- Progress Bar Helper ---
+async def progress_bar(current, total, action_prefix):
+    """Displays a simple percentage progress in the console."""
+    if total > 0:
+        percent = (current / total) * 100
+        # Carriage return \r overwrites the current line
+        print(f"\r {action_prefix}: {percent:.1f}% ({current // (1024*1024)}MB / {total // (1024*1024)}MB)", end="")
 
 async def sync_dialog_cache():
-    """Iterates recent dialogs to ensure peer access_hashes are cached in SQLite."""
     print("[*] Synchronizing chat dialogs...")
     async for _ in app.get_dialogs(limit=50):
         pass
-
 
 async def verify_destination_permissions(app: Client, dest_chat) -> bool:
     try:
@@ -91,17 +98,19 @@ async def verify_destination_permissions(app: Client, dest_chat) -> bool:
 
     return True
 
-
 async def main():
     async with app:
         me = await app.get_me()
         print(f"[+] Logged in as: {me.first_name} (@{me.username}) | ID: {me.id}\n")
 
-        # Sync dialogs so peers are loaded into SQLite storage
         await sync_dialog_cache()
 
         src_input = input("Enter Source Channel ID or @username: ")
         dst_input = input("Enter Destination Channel/User ID or @username: ")
+        
+        # Optional: Ask user if they want to limit the history scan
+        limit_input = input("Enter max messages to scan (Leave blank for ALL): ")
+        scan_limit = int(limit_input) if limit_input.strip().isdigit() else None
 
         source_chat = parse_chat_target(src_input)
         dest_chat = parse_chat_target(dst_input)
@@ -114,7 +123,7 @@ async def main():
         print(f"[+] Permissions verified. Scanning {source_chat} for videos...")
 
         video_messages = []
-        async for message in app.get_chat_history(source_chat):
+        async for message in app.get_chat_history(source_chat, limit=scan_limit):
             if message.video:
                 video_messages.append(message)
 
@@ -134,12 +143,17 @@ async def main():
             try:
                 file_label = msg.video.file_name or "video.mp4"
                 file_mb = round(msg.video.file_size / (1024 * 1024), 2)
-                print(f" -> Downloading: {file_label} ({file_mb} MB)...")
-                downloaded_path = await app.download_media(msg)
+                print(f" -> Queued: {file_label} ({file_mb} MB)")
+                
+                downloaded_path = await app.download_media(
+                    msg, 
+                    progress=progress_bar, 
+                    progress_args=("-> Downloading",)
+                )
+                print() # Print newline after progress bar finishes
 
                 while True:
                     try:
-                        print(" -> Uploading with thumbnail stripped...")
                         await app.send_video(
                             chat_id=dest_chat,
                             video=downloaded_path,
@@ -147,23 +161,25 @@ async def main():
                             duration=msg.video.duration,
                             width=msg.video.width,
                             height=msg.video.height,
-                            thumb=None,
-                            supports_streaming=True
+                            thumbnail=None, # Changed 'thumb' to 'thumbnail' for Pyrogram v2
+                            supports_streaming=True,
+                            progress=progress_bar,
+                            progress_args=("-> Uploading",)
                         )
-                        print(f"[✓] Uploaded successfully (Msg ID: {msg.id})")
+                        print(f"\n[✓] Uploaded successfully (Msg ID: {msg.id})")
                         await asyncio.sleep(2)
                         break
 
                     except FloodWait as e:
-                        print(f"[!] FloodWait received: Sleeping {e.value}s...")
+                        print(f"\n[!] FloodWait received: Sleeping {e.value}s...")
                         await asyncio.sleep(e.value)
 
                     except ChatWriteForbidden:
-                        print(f"[x] Fatal: ChatWriteForbidden. You cannot post in {dest_chat}.")
+                        print(f"\n[x] Fatal: ChatWriteForbidden. You cannot post in {dest_chat}.")
                         return
 
             except Exception as e:
-                print(f"[x] Error on message {msg.id}: {e}")
+                print(f"\n[x] Error on message {msg.id}: {e}")
 
             finally:
                 if downloaded_path and os.path.exists(downloaded_path):
@@ -175,6 +191,8 @@ async def main():
 
         print("\n[+] All videos processed successfully!")
 
-
 if __name__ == "__main__":
-    app.run(main())
+    try:
+        app.run(main())
+    except KeyboardInterrupt:
+        print("\n\n[-] Script terminated by user.")
